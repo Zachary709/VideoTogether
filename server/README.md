@@ -1,4 +1,4 @@
-﻿# Server
+# Server
 
 服务端是一个极简 HTTP/HTTPS 轮询房间服务，负责：
 
@@ -6,6 +6,8 @@
 - 维护房间成员与主控
 - 接收主控同步事件
 - 通过轮询接口向跟随端分发事件
+- 维护每个成员最近一次上报的播放状态
+- 在跟随者上报时，根据主控状态快照计算是否需要纠偏
 - 清理长时间未轮询的失效成员
 - 返回跨域响应头，允许用户脚本从 Bilibili 页面请求接口
 
@@ -44,7 +46,13 @@ HTTPS：
 - 因 URL 跳转触发的自动恢复连接不会抢占主控
 - `/rooms/join` 支持 `sinceEventId`，自动恢复时只拉取增量事件，避免重复重放历史切换事件
 
-这套规则是为了支持“房间不变，但由某一方主动带着大家切到新视频或番剧页面”的场景。
+## 状态同步机制
+
+- 主控会持续上报自己的最近播放状态：`currentTime`、`paused`、`playbackRate`、`reportedAt`
+- 跟随者也会低频上报自己的播放状态
+- 服务端根据主控的最新快照估算“主控此刻理论进度”，并和跟随者当前估算进度比较
+- 只有在偏差超过阈值，或者跟随者明确以 `readyForSync=true` 请求补偿时，服务端才返回 `syncInstruction`
+- 这样可以把高频同步压力从“不断追事件”改成“按需纠偏”
 
 ## 用 mkcert 生成 HTTPS 证书
 
@@ -87,5 +95,6 @@ https://7e526c6c1d80.ofalias.net:59905
 - `POST /rooms/join`
 - `POST /rooms/leave`
 - `POST /rooms/events`
+- `POST /rooms/state`
 - `GET /rooms/poll`
 - `GET /health`

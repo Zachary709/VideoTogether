@@ -1,11 +1,11 @@
-﻿import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "http";
 import { createServer as createHttpsServer } from "https";
 import { join } from "path";
 import { URL } from "url";
 import { createClientId, parseMessage } from "./protocol";
 import { RoomManager } from "./roomManager";
-import type { BaseMessage, JoinResponse, PollResponse } from "./types";
+import type { BaseMessage, JoinResponse, PlaybackSnapshot, PollResponse, ReportStateResponse } from "./types";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -153,6 +153,60 @@ async function requestHandler(request: IncomingMessage, response: ServerResponse
       clientId,
       masterId: room?.masterId ?? null,
       events: roomManager.poll(roomId, clientId, Number.isFinite(since) ? since : 0)
+    };
+
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/rooms/state") {
+    const raw = await readBody(request);
+    const body = parseJson<PlaybackSnapshot & { readyForSync?: boolean }>(raw);
+    const roomId = body?.roomId?.trim();
+    const clientId = body?.clientId?.trim();
+
+    if (
+      !roomId ||
+      !clientId ||
+      !body?.videoKey ||
+      typeof body.currentTime !== "number" ||
+      typeof body.paused !== "boolean" ||
+      typeof body.reportedAt !== "number"
+    ) {
+      sendJson(response, 400, { ok: false, error: "Invalid state payload" });
+      return;
+    }
+
+    const playbackRate = typeof body.playbackRate === "number" && Number.isFinite(body.playbackRate)
+      ? body.playbackRate
+      : 1;
+
+    const result = roomManager.reportState(
+      roomId,
+      clientId,
+      {
+        roomId,
+        clientId,
+        videoKey: body.videoKey,
+        currentTime: body.currentTime,
+        paused: body.paused,
+        playbackRate,
+        reportedAt: body.reportedAt
+      },
+      body.readyForSync === true
+    );
+
+    if (!result.ok) {
+      sendJson(response, 400, { ok: false, error: result.error });
+      return;
+    }
+
+    const payload: ReportStateResponse = {
+      ok: true,
+      roomId,
+      clientId,
+      masterId: result.room?.masterId ?? null,
+      syncInstruction: result.syncInstruction ?? null
     };
 
     sendJson(response, 200, payload);

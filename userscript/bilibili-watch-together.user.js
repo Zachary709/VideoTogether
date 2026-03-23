@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili Watch Together MVP
 // @namespace    https://github.com/local/bilibili-watch-together
-// @version      2.1.2
+// @version      2.2.1
 // @description  Sync Bilibili playback across browsers through an HTTPS polling room service.
 // @author       Codex
 // @match        https://www.bilibili.com/video/*
@@ -16,12 +16,14 @@
   const PANEL_ID = "vt-watch-together-panel";
   const STORAGE_KEY = "vt-watch-together-api-base";
   const SESSION_KEY = "vt-watch-together-session";
-  const DEFAULT_API_BASE = localStorage.getItem(STORAGE_KEY) || "http://localhost:8787";
+  const DEFAULT_API_BASE = localStorage.getItem(STORAGE_KEY) || "https://7e526c6c1d80.ofalias.net:59905";
   const SEEK_TOLERANCE = 0.8;
   const REMOTE_GUARD_MS = 1200;
   const SEEK_BROADCAST_DEBOUNCE_MS = 350;
   const POLL_INTERVAL_MS = 1200;
+  const STATE_REPORT_INTERVAL_MS = 10000;
   const AUTO_REJOIN_DELAY_MS = 1200;
+  const REDIRECT_GUARD_MS = 8000;
 
   const state = {
     clientId: `client_${Math.random().toString(36).slice(2, 10)}`,
@@ -35,6 +37,7 @@
     lastRemoteAppliedAt: 0,
     seekTimer: null,
     pollTimer: null,
+    reportTimer: null,
     lastEventId: 0,
     lastLog: "脚本已加载，等待初始化",
     autoplayHint: "",
@@ -42,7 +45,11 @@
     initialized: false,
     panelAttached: false,
     isPolling: false,
-    autoJoinAttempted: false
+    isReportingState: false,
+    autoJoinAttempted: false,
+    pendingReadySync: false,
+    lastRedirectTarget: "",
+    lastRedirectAt: 0
   };
 
   let ui = null;
@@ -134,6 +141,10 @@
       refreshVideo(true);
       bindVideoListeners();
       log(state.currentVideo ? "已重新检测播放器" : "未检测到可播放视频");
+      if (state.connectionState === "connected" && !state.isMaster) {
+        state.pendingReadySync = true;
+        void maybeRequestReadySync();
+      }
     });
 
     actions.append(connectButton, leaveButton, masterButton, refreshButton);
@@ -174,7 +185,10 @@
 
   function attachPanel() {
     if (!ui) return;
-    if (document.getElementById(PANEL_ID)) { state.panelAttached = true; return; }
+    if (document.getElementById(PANEL_ID)) {
+      state.panelAttached = true;
+      return;
+    }
     ui.root.id = PANEL_ID;
     (document.body || document.documentElement).appendChild(ui.root);
     state.panelAttached = true;
@@ -223,7 +237,20 @@
   }
 
   function createMessage(type, payload) {
-    return { type, roomId: state.roomId, senderId: state.clientId, timestamp: Date.now(), videoKey: createVideoKey(), payload };
+    return {
+      type,
+      roomId: state.roomId,
+      senderId: state.clientId,
+      timestamp: Date.now(),
+      videoKey: createVideoKey(),
+      payload
+    };
+  }
+
+  function isSameVideoKey(left, right) {
+    if (!left || !right) return false;
+    if (left.epId && right.epId) return left.epId === right.epId;
+    if (left.bvid && right.bvid) return left.bvid === right.bvid && ((left.p || 1) === (right.p || 1));    return normalizeContentUrl(left.url || "") === normalizeContentUrl(right.url || "");
   }
 
   function log(message) {
@@ -235,17 +262,22 @@
   function refreshVideo(forceLog) {
     state.currentVideo = findBestVideo();
     state.currentVideoKey = createVideoKey();
-    if (forceLog) log(state.currentVideo ? "已检测到可播放视频" : "未检测到可播放视频");
-    else render();
+    if (forceLog) {
+      log(state.currentVideo ? "已检测到可播放视频" : "未检测到可播放视频");
+    } else {
+      render();
+    }
   }
 
   function findBestVideo() {
     const videos = Array.from(document.querySelectorAll("video"));
     if (!videos.length) return null;
-    const ranked = videos.map((video) => {
-      const rect = video.getBoundingClientRect();
-      return { video, visible: rect.width > 0 && rect.height > 0, area: rect.width * rect.height };
-    }).sort((a, b) => Number(b.visible) - Number(a.visible) || b.area - a.area);
+    const ranked = videos
+      .map((video) => {
+        const rect = video.getBoundingClientRect();
+        return { video, visible: rect.width > 0 && rect.height > 0, area: rect.width * rect.height };
+      })
+      .sort((a, b) => Number(b.visible) - Number(a.visible) || b.area - a.area);
     return ranked[0] ? ranked[0].video : null;
   }
 
@@ -253,15 +285,70 @@
     const video = state.currentVideo;
     if (!video || video.dataset.watchTogetherBound === "1") return;
     video.dataset.watchTogetherBound = "1";
-    video.addEventListener("play", () => { if (shouldBroadcastLocalEvent()) void postEvent("play", { currentTime: video.currentTime, paused: false }); });
-    video.addEventListener("pause", () => { if (shouldBroadcastLocalEvent()) void postEvent("pause", { currentTime: video.currentTime, paused: true }); });
+
+    video.addEventListener("play", () => {
+      if (!shouldBroadcastLocalEvent()) return;
+      const snapshot = createPlaybackSnapshot(video);
+      void postEvent("play", {
+        currentTime: snapshot.currentTime,
+        paused: false,
+        sentAt: snapshot.reportedAt,
+        playbackRate: snapshot.playbackRate
+      });
+      void reportPlaybackState({ silent: true });
+    });
+
+    video.addEventListener("pause", () => {
+      if (!shouldBroadcastLocalEvent()) return;
+      const snapshot = createPlaybackSnapshot(video);
+      void postEvent("pause", { currentTime: snapshot.currentTime, paused: true });
+      void reportPlaybackState({ silent: true });
+    });
+
     video.addEventListener("seeking", () => {
       if (!shouldBroadcastLocalEvent()) return;
       if (state.seekTimer) clearTimeout(state.seekTimer);
-      state.seekTimer = window.setTimeout(() => { void postEvent("seek", { currentTime: video.currentTime, paused: video.paused }); }, SEEK_BROADCAST_DEBOUNCE_MS);
+      state.seekTimer = window.setTimeout(() => {
+        const snapshot = createPlaybackSnapshot(video);
+        void postEvent("seek", {
+          currentTime: snapshot.currentTime,
+          paused: snapshot.paused,
+          sentAt: snapshot.reportedAt,
+          playbackRate: snapshot.playbackRate
+        });
+        void reportPlaybackState({ silent: true });
+      }, SEEK_BROADCAST_DEBOUNCE_MS);
     });
-    video.addEventListener("seeked", () => { if (shouldBroadcastLocalEvent()) void postEvent("seek", { currentTime: video.currentTime, paused: video.paused }); });
-    video.addEventListener("loadedmetadata", () => { state.currentVideoKey = createVideoKey(); render(); });
+
+    video.addEventListener("seeked", () => {
+      if (!shouldBroadcastLocalEvent()) return;
+      const snapshot = createPlaybackSnapshot(video);
+      void postEvent("seek", {
+        currentTime: snapshot.currentTime,
+        paused: snapshot.paused,
+        sentAt: snapshot.reportedAt,
+        playbackRate: snapshot.playbackRate
+      });
+      void reportPlaybackState({ silent: true });
+    });
+
+    video.addEventListener("loadedmetadata", () => {
+      state.currentVideoKey = createVideoKey();
+      render();
+      if (state.lastRedirectTarget === normalizeContentUrl(location.href)) {
+        state.lastRedirectTarget = "";
+        state.lastRedirectAt = 0;
+        persistSession();
+      }
+      if (state.connectionState === "connected") {
+        if (state.isMaster) {
+          void reportPlaybackState({ silent: true });
+        } else {
+          state.pendingReadySync = true;
+          void maybeRequestReadySync();
+        }
+      }
+    });
   }
 
   function shouldBroadcastLocalEvent() {
@@ -271,10 +358,45 @@
     return state.connectionState === "connected";
   }
 
+  function createPlaybackSnapshot(video = state.currentVideo) {
+    if (!video) return null;
+    return {
+      roomId: state.roomId,
+      clientId: state.clientId,
+      videoKey: createVideoKey(),
+      currentTime: video.currentTime,
+      paused: video.paused,
+      playbackRate: Number.isFinite(video.playbackRate) ? video.playbackRate : 1,
+      reportedAt: Date.now()
+    };
+  }
+
+  function hasRecentRedirect(targetUrl) {
+    return state.lastRedirectTarget === targetUrl && Date.now() - state.lastRedirectAt < REDIRECT_GUARD_MS;
+  }
+
+  function markRedirect(targetUrl) {
+    state.lastRedirectTarget = targetUrl;
+    state.lastRedirectAt = Date.now();
+    persistSession();
+  }
+
+  async function maybeRequestReadySync() {
+    if (!state.pendingReadySync || state.isMaster || state.connectionState !== "connected") return;
+    refreshVideo(false);
+    const video = state.currentVideo;
+    if (!video || video.readyState < 1) return;
+    state.pendingReadySync = false;
+    await reportPlaybackState({ readyForSync: true, silent: true });
+  }
+
   async function joinRoom(options) {
     const skipLog = !!(options && options.skipLog);
     const takeoverMaster = !(options && options.autoRestore);
-    if (!state.roomId) { log("请先输入房间号"); return; }
+    if (!state.roomId) {
+      log("请先输入房间号");
+      return;
+    }
     if (state.connectionState === "connecting" || state.connectionState === "connected") return;
     state.connectionState = "connecting";
     state.autoplayHint = "";
@@ -283,7 +405,13 @@
     try {
       const response = await apiFetch("/rooms/join", {
         method: "POST",
-        body: JSON.stringify({ roomId: state.roomId, clientId: state.clientId, videoKey: createVideoKey(), sinceEventId: state.lastEventId, takeoverMaster })
+        body: JSON.stringify({
+          roomId: state.roomId,
+          clientId: state.clientId,
+          videoKey: createVideoKey(),
+          sinceEventId: state.lastEventId,
+          takeoverMaster
+        })
       });
       state.clientId = response.clientId;
       state.lastEventId = getMaxEventId(response.events, state.lastEventId);
@@ -291,9 +419,16 @@
       state.connectionState = "connected";
       persistSession();
       startPolling();
+      startStateReporting();
       render();
       log(`已加入房间 ${state.roomId}，当前主控：${response.masterId || "无"}`);
       for (const event of response.events) handleIncomingEvent(event);
+      if (!state.isMaster) {
+        state.pendingReadySync = true;
+        void maybeRequestReadySync();
+      } else {
+        void reportPlaybackState({ silent: true });
+      }
     } catch (error) {
       state.connectionState = "disconnected";
       render();
@@ -303,9 +438,13 @@
 
   async function leaveRoom() {
     stopPolling();
+    stopStateReporting();
     if (state.connectionState === "connected") {
       try {
-        await apiFetch("/rooms/leave", { method: "POST", body: JSON.stringify({ roomId: state.roomId, clientId: state.clientId, videoKey: createVideoKey() }) });
+        await apiFetch("/rooms/leave", {
+          method: "POST",
+          body: JSON.stringify({ roomId: state.roomId, clientId: state.clientId, videoKey: createVideoKey() })
+        });
       } catch (error) {
         log(`离开房间请求失败：${formatError(error)}`);
       }
@@ -329,22 +468,49 @@
     const message = createMessage(type, payload);
     try {
       const response = await apiFetch("/rooms/events", { method: "POST", body: JSON.stringify(message) });
-      if (typeof response.masterId !== "undefined") { state.isMaster = response.masterId === state.clientId; render(); }
+      if (typeof response.masterId !== "undefined") {
+        state.isMaster = response.masterId === state.clientId;
+        render();
+      }
       persistSession();
     } catch (error) {
       log(`事件发送失败：${formatError(error)}`);
-      if (String(error).includes("Failed to fetch")) { state.connectionState = "disconnected"; render(); }
+      if (String(error).includes("Failed to fetch")) {
+        state.connectionState = "disconnected";
+        stopPolling();
+        stopStateReporting();
+        render();
+      }
     }
   }
 
   function startPolling() {
     stopPolling();
-    state.pollTimer = window.setInterval(() => { void pollOnce(); }, POLL_INTERVAL_MS);
+    state.pollTimer = window.setInterval(() => {
+      void pollOnce();
+    }, POLL_INTERVAL_MS);
     void pollOnce();
   }
 
   function stopPolling() {
-    if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+    if (state.pollTimer) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+  }
+
+  function startStateReporting() {
+    stopStateReporting();
+    state.reportTimer = window.setInterval(() => {
+      void reportPlaybackState({ silent: true });
+    }, STATE_REPORT_INTERVAL_MS);
+  }
+
+  function stopStateReporting() {
+    if (state.reportTimer) {
+      clearInterval(state.reportTimer);
+      state.reportTimer = null;
+    }
   }
 
   async function pollOnce() {
@@ -362,6 +528,7 @@
       state.connectionState = "disconnected";
       state.isMaster = false;
       stopPolling();
+      stopStateReporting();
       render();
       log(`轮询失败：${formatError(error)}`);
     } finally {
@@ -369,23 +536,61 @@
     }
   }
 
+  async function reportPlaybackState(options) {
+    if (state.isReportingState || state.connectionState !== "connected") return;
+    refreshVideo(false);
+    const snapshot = createPlaybackSnapshot();
+    if (!snapshot) return;
+
+    state.isReportingState = true;
+    try {
+      const response = await apiFetch("/rooms/state", {
+        method: "POST",
+        body: JSON.stringify({ ...snapshot, readyForSync: !!(options && options.readyForSync) })
+      });
+      state.isMaster = response.masterId === state.clientId;
+      persistSession();
+      render();
+      if (response.syncInstruction && !state.isMaster) {
+        await applySyncInstruction(response.syncInstruction);
+      }
+    } catch (error) {
+      if (!(options && options.silent)) {
+        log(`状态上报失败：${formatError(error)}`);
+      }
+    } finally {
+      state.isReportingState = false;
+    }
+  }
+
   function handleIncomingEvent(event) {
     switch (event.type) {
-      case "join": log(`成员加入：${event.senderId}`); break;
-      case "leave": log(`成员离开：${event.senderId}`); break;
+      case "join":
+        log(`成员加入：${event.senderId}`);
+        break;
+      case "leave":
+        log(`成员离开：${event.senderId}`);
+        break;
       case "masterChanged":
         state.isMaster = event.payload && event.payload.masterId === state.clientId;
         persistSession();
         log(`主控已切换：${(event.payload && event.payload.masterId) || "无"}`);
         render();
+        if (!state.isMaster && state.connectionState === "connected") {
+          state.pendingReadySync = true;
+          void maybeRequestReadySync();
+        }
         break;
       case "play":
       case "pause":
       case "seek":
       case "changePart":
-        if (event.senderId !== state.clientId) void applyRemoteMessage(event);
+        if (event.senderId !== state.clientId) {
+          void applyRemoteMessage(event);
+        }
         break;
-      default: break;
+      default:
+        break;
     }
   }
 
@@ -396,31 +601,144 @@
       await applyChangePart(message);
       return;
     }
+
     refreshVideo(false);
     const video = state.currentVideo;
-    if (!video) { log("未检测到播放器，无法执行远端同步"); return; }
+    if (!video) {
+      log("未检测到播放器，无法执行远端同步");
+      return;
+    }
+
     state.isApplyingRemoteEvent = true;
     state.lastRemoteAppliedAt = Date.now();
     try {
-      const targetTime = message.payload && message.payload.currentTime;
-      if (typeof targetTime === "number" && Math.abs(video.currentTime - targetTime) > SEEK_TOLERANCE) video.currentTime = targetTime;
-      if (message.type === "play") { await safePlay(video); log(`已同步播放 @ ${formatTime(video.currentTime)}`); return; }
-      if (message.type === "pause") { video.pause(); log(`已同步暂停 @ ${formatTime(video.currentTime)}`); return; }
+      const targetTime = estimateTargetTimeFromMessage(message);
+      if (typeof targetTime === "number" && Math.abs(video.currentTime - targetTime) > SEEK_TOLERANCE) {
+        video.currentTime = targetTime;
+      }
+
+      if (message.payload && typeof message.payload.playbackRate === "number" && Number.isFinite(message.payload.playbackRate)) {
+        video.playbackRate = message.payload.playbackRate;
+      }
+
+      if (message.type === "play") {
+        await safePlay(video);
+        log(`已补偿同步播放 @ ${formatTime(video.currentTime)}`);
+        return;
+      }
+
+      if (message.type === "pause") {
+        video.pause();
+        log(`已同步暂停 @ ${formatTime(video.currentTime)}`);
+        return;
+      }
+
       if (message.type === "seek") {
-        if (message.payload && message.payload.paused === false) await safePlay(video); else video.pause();
+        if (message.payload && message.payload.paused === false) {
+          await safePlay(video);
+        } else {
+          video.pause();
+        }
         log(`已同步进度到 ${formatTime(video.currentTime)}`);
       }
     } finally {
-      window.setTimeout(() => { state.isApplyingRemoteEvent = false; }, 0);
+      window.setTimeout(() => {
+        state.isApplyingRemoteEvent = false;
+      }, 0);
     }
   }
 
   async function applyChangePart(message) {
-    const targetUrl = normalizeContentUrl((message.payload && message.payload.targetUrl) || (message.videoKey && message.videoKey.url) || "");
+    const targetVideoKey = (message && message.videoKey) || { url: (message.payload && message.payload.targetUrl) || "" };
+    const targetUrl = normalizeContentUrl((message.payload && message.payload.targetUrl) || targetVideoKey.url || "");
     if (!targetUrl) return;
-    const currentUrl = normalizeContentUrl(location.href);
-    if (currentUrl !== targetUrl) { log(`正在同步切换到 ${targetUrl}`); location.href = targetUrl; return; }
-    log("远端目标 URL 与当前一致，跳过跳转");
+    const currentVideoKey = createVideoKey();
+    if (!isSameVideoKey(currentVideoKey, targetVideoKey)) {
+      if (hasRecentRedirect(targetUrl)) {
+        log(`已在短时间内跳转过 ${targetUrl}，本次忽略重复跳转`);
+        return;
+      }
+      log(`正在同步切换到 ${targetUrl}`);
+      markRedirect(targetUrl);
+      location.href = targetUrl;
+      return;
+    }
+    log("远端目标 URL 与当前一致，等待 ready 同步进度");
+    state.pendingReadySync = true;
+    void maybeRequestReadySync();
+  }
+
+  async function applySyncInstruction(instruction) {
+    const targetVideoKey = instruction && instruction.videoKey ? instruction.videoKey : { url: (instruction && instruction.targetUrl) || "" };
+    const targetUrl = normalizeContentUrl((instruction && instruction.targetUrl) || targetVideoKey.url || "");
+    const currentVideoKey = createVideoKey();
+    if (targetUrl && !isSameVideoKey(currentVideoKey, targetVideoKey)) {
+      if (hasRecentRedirect(targetUrl)) {
+        log(`已在短时间内跳转过 ${targetUrl}，本次忽略重复跳转`);
+        return;
+      }
+      log(`服务端要求同步到新页面：${targetUrl}`);
+      markRedirect(targetUrl);
+      location.href = targetUrl;
+      return;
+    }
+
+    refreshVideo(false);
+    const video = state.currentVideo;
+    if (!video) {
+      state.pendingReadySync = true;
+      log("未检测到播放器，无法执行服务端纠偏");
+      return;
+    }
+
+    state.isApplyingRemoteEvent = true;
+    state.lastRemoteAppliedAt = Date.now();
+    try {
+      const targetTime = estimateTargetTimeFromInstruction(instruction);
+      if (Math.abs(video.currentTime - targetTime) > SEEK_TOLERANCE) {
+        video.currentTime = targetTime;
+      }
+      if (typeof instruction.playbackRate === "number" && Number.isFinite(instruction.playbackRate)) {
+        video.playbackRate = instruction.playbackRate;
+      }
+      if (instruction.paused) {
+        video.pause();
+      } else {
+        await safePlay(video);
+      }
+      log(`已按${formatSyncReason(instruction.reason)}补偿到 ${formatTime(video.currentTime)}`);
+    } finally {
+      window.setTimeout(() => {
+        state.isApplyingRemoteEvent = false;
+      }, 0);
+    }
+  }
+
+  function estimateTargetTimeFromMessage(message) {
+    if (!message || !message.payload) return undefined;
+    const currentTime = typeof message.payload.currentTime === "number" ? message.payload.currentTime : undefined;
+    if (typeof currentTime !== "number") return undefined;
+
+    if (message.type === "play" || (message.type === "seek" && message.payload.paused === false)) {
+      const sentAt = typeof message.payload.sentAt === "number" ? message.payload.sentAt : message.timestamp;
+      const playbackRate = typeof message.payload.playbackRate === "number" && Number.isFinite(message.payload.playbackRate)
+        ? message.payload.playbackRate
+        : 1;
+      const deltaSec = Math.max(0, Date.now() - sentAt) / 1000;
+      return currentTime + deltaSec * playbackRate;
+    }
+
+    return currentTime;
+  }
+
+  function estimateTargetTimeFromInstruction(instruction) {
+    if (!instruction) return 0;
+    if (instruction.paused) return instruction.currentTime;
+    const playbackRate = typeof instruction.playbackRate === "number" && Number.isFinite(instruction.playbackRate)
+      ? instruction.playbackRate
+      : 1;
+    const deltaSec = Math.max(0, Date.now() - instruction.reportedAt) / 1000;
+    return instruction.currentTime + deltaSec * playbackRate;
   }
 
   async function safePlay(video) {
@@ -445,6 +763,9 @@
       refreshVideo(false);
       bindVideoListeners();
       attachPanel();
+      if (state.connectionState === "connected") {
+        state.pendingReadySync = !state.isMaster;
+      }
       if (state.connectionState === "connected" && state.isMaster) {
         persistSession();
         void postEvent("changePart", { targetUrl: normalizedUrl });
@@ -452,6 +773,7 @@
       }
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
+
     window.addEventListener("popstate", () => {
       const normalizedUrl = normalizeContentUrl(location.href);
       if (normalizedUrl !== state.lastKnownUrl) {
@@ -473,6 +795,8 @@
         state.apiBase = typeof saved.apiBase === "string" ? saved.apiBase : state.apiBase;
         state.clientId = typeof saved.clientId === "string" ? saved.clientId : state.clientId;
         state.lastEventId = typeof saved.lastEventId === "number" ? saved.lastEventId : 0;
+        state.lastRedirectTarget = typeof saved.lastRedirectTarget === "string" ? saved.lastRedirectTarget : "";
+        state.lastRedirectAt = typeof saved.lastRedirectAt === "number" ? saved.lastRedirectAt : 0;
       }
     } catch (error) {
       console.warn("[watch-together] failed to restore session", error);
@@ -481,14 +805,30 @@
 
   function persistSession() {
     try {
-      if (!state.roomId) { sessionStorage.removeItem(SESSION_KEY); return; }
-      sessionStorage.setItem(SESSION_KEY, JSON.stringify({ roomId: state.roomId, apiBase: state.apiBase, clientId: state.clientId, lastEventId: state.lastEventId, savedAt: Date.now() }));
+      if (!state.roomId) {
+        sessionStorage.removeItem(SESSION_KEY);
+        return;
+      }
+      sessionStorage.setItem(
+        SESSION_KEY,
+        JSON.stringify({
+          roomId: state.roomId,
+          apiBase: state.apiBase,
+          clientId: state.clientId,
+          lastEventId: state.lastEventId,
+          lastRedirectTarget: state.lastRedirectTarget,
+          lastRedirectAt: state.lastRedirectAt,
+          savedAt: Date.now()
+        })
+      );
     } catch (error) {
       console.warn("[watch-together] failed to persist session", error);
     }
   }
 
-  function clearSession() { sessionStorage.removeItem(SESSION_KEY); }
+  function clearSession() {
+    sessionStorage.removeItem(SESSION_KEY);
+  }
 
   function maybeAutoJoin() {
     if (state.autoJoinAttempted || !state.roomId || !state.apiBase || state.connectionState === "connected") return;
@@ -511,18 +851,24 @@
     return data;
   }
 
-  function normalizeApiBase(value) { return value.replace(/\/+$/, ""); }
+  function normalizeApiBase(value) {
+    return value.replace(/\/+$/, "");
+  }
 
   function getMaxEventId(events, fallback) {
     let current = fallback;
-    for (const event of events || []) if (typeof event.id === "number" && event.id > current) current = event.id;
+    for (const event of events || []) {
+      if (typeof event.id === "number" && event.id > current) current = event.id;
+    }
     return current;
   }
 
-  function formatError(error) { return error instanceof Error ? error.message : String(error); }
+  function formatError(error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 
   function formatTime(seconds) {
-    const total = Math.floor(seconds);
+    const total = Math.floor(Math.max(0, seconds));
     const mins = Math.floor(total / 60);
     const secs = total % 60;
     return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
@@ -530,12 +876,31 @@
 
   function formatConnectionState(connectionState) {
     switch (connectionState) {
-      case "idle": return "未连接";
-      case "connecting": return "连接中";
-      case "connected": return "已连接";
-      case "disconnected": return "已断开";
-      case "error": return "错误";
-      default: return connectionState;
+      case "idle":
+        return "未连接";
+      case "connecting":
+        return "连接中";
+      case "connected":
+        return "已连接";
+      case "disconnected":
+        return "已断开";
+      case "error":
+        return "错误";
+      default:
+        return connectionState;
+    }
+  }
+
+  function formatSyncReason(reason) {
+    switch (reason) {
+      case "ready":
+        return "ready 同步";
+      case "drift":
+        return "漂移纠偏";
+      case "followMaster":
+        return "主控跟随";
+      default:
+        return "服务端同步";
     }
   }
 })();
