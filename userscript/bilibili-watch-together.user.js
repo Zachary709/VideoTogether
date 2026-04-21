@@ -16,7 +16,8 @@
   const PANEL_ID = "vt-watch-together-panel";
   const STORAGE_KEY = "vt-watch-together-api-base";
   const SESSION_KEY = "vt-watch-together-session";
-  const DEFAULT_API_BASE = localStorage.getItem(STORAGE_KEY) || "https://7e526c6c1d80.ofalias.net:59905";
+  const DEFAULT_REMOTE_API_BASE = "https://7e526c6c1d80.ofalias.net:53120";
+  const LOCAL_DEBUG_API_BASE = "http://localhost:7777";
   const SEEK_TOLERANCE = 0.8;
   const REMOTE_GUARD_MS = 1200;
   const SEEK_BROADCAST_DEBOUNCE_MS = 350;
@@ -28,7 +29,7 @@
   const state = {
     clientId: `client_${Math.random().toString(36).slice(2, 10)}`,
     roomId: "",
-    apiBase: DEFAULT_API_BASE,
+    apiBase: loadInitialApiBase(),
     connectionState: "idle",
     isMaster: false,
     currentVideo: null,
@@ -115,7 +116,13 @@
     apiInput.value = state.apiBase;
     apiInput.style.cssText = inputStyle();
     apiInput.addEventListener("change", () => {
-      state.apiBase = normalizeApiBase(apiInput.value.trim());
+      const normalized = normalizeApiBase(apiInput.value.trim(), { useDefaultWhenEmpty: true });
+      if (!normalized.ok) {
+        render();
+        log(`服务地址无效：${normalized.error}`);
+        return;
+      }
+      state.apiBase = normalized.value;
       localStorage.setItem(STORAGE_KEY, state.apiBase);
       persistSession();
       render();
@@ -250,7 +257,8 @@
   function isSameVideoKey(left, right) {
     if (!left || !right) return false;
     if (left.epId && right.epId) return left.epId === right.epId;
-    if (left.bvid && right.bvid) return left.bvid === right.bvid && ((left.p || 1) === (right.p || 1));    return normalizeContentUrl(left.url || "") === normalizeContentUrl(right.url || "");
+    if (left.bvid && right.bvid) return left.bvid === right.bvid && ((left.p || 1) === (right.p || 1));
+    return normalizeContentUrl(left.url || "") === normalizeContentUrl(right.url || "");
   }
 
   function log(message) {
@@ -398,10 +406,17 @@
       return;
     }
     if (state.connectionState === "connecting" || state.connectionState === "connected") return;
+    const normalizedApiBase = ensureNormalizedApiBase({ useDefaultWhenEmpty: true });
+    if (!normalizedApiBase.ok) {
+      state.connectionState = "error";
+      render();
+      log(`服务地址无效：${normalizedApiBase.error}`);
+      return;
+    }
     state.connectionState = "connecting";
     state.autoplayHint = "";
     render();
-    if (!skipLog) log(`正在连接 ${state.apiBase}`);
+    if (!skipLog) log(`正在连接 ${normalizedApiBase.value}`);
     try {
       const response = await apiFetch("/rooms/join", {
         method: "POST",
@@ -792,7 +807,10 @@
       const saved = JSON.parse(raw);
       if (saved && typeof saved === "object") {
         state.roomId = typeof saved.roomId === "string" ? saved.roomId : state.roomId;
-        state.apiBase = typeof saved.apiBase === "string" ? saved.apiBase : state.apiBase;
+        if (typeof saved.apiBase === "string") {
+          const normalized = normalizeApiBase(saved.apiBase, { useDefaultWhenEmpty: true });
+          state.apiBase = normalized.ok ? normalized.value : saved.apiBase;
+        }
         state.clientId = typeof saved.clientId === "string" ? saved.clientId : state.clientId;
         state.lastEventId = typeof saved.lastEventId === "number" ? saved.lastEventId : 0;
         state.lastRedirectTarget = typeof saved.lastRedirectTarget === "string" ? saved.lastRedirectTarget : "";
@@ -842,17 +860,108 @@
   }
 
   async function apiFetch(path, options) {
-    const response = await fetch(`${normalizeApiBase(state.apiBase)}${path}`, {
-      ...options,
-      headers: { "Content-Type": "application/json", ...(options && options.headers ? options.headers : {}) }
-    });
+    const normalizedApiBase = ensureNormalizedApiBase({ useDefaultWhenEmpty: true });
+    if (!normalizedApiBase.ok) {
+      throw new Error(`服务地址无效：${normalizedApiBase.error}`);
+    }
+
+    const requestUrl = `${normalizedApiBase.value}${path}`;
+    let response;
+    try {
+      response = await fetch(requestUrl, {
+        ...options,
+        headers: { "Content-Type": "application/json", ...(options && options.headers ? options.headers : {}) }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/aborted/i.test(message)) {
+        throw new Error(`连接被中止：${requestUrl}`);
+      }
+      throw new Error(`无法连接到服务：${requestUrl}`);
+    }
     const data = await response.json().catch(() => ({}));
-    if (!response.ok || data.ok === false) throw new Error(data.error || `HTTP ${response.status}`);
+    if (response.status === 404) {
+      throw new Error(`HTTP 404：${requestUrl}`);
+    }
+    if (!response.ok || data.ok === false) {
+      throw new Error(`${data.error || `HTTP ${response.status}`}：${requestUrl}`);
+    }
     return data;
   }
 
-  function normalizeApiBase(value) {
-    return value.replace(/\/+$/, "");
+  function loadInitialApiBase() {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (!stored || !stored.trim()) {
+      return DEFAULT_REMOTE_API_BASE;
+    }
+
+    const normalized = normalizeApiBase(stored, { useDefaultWhenEmpty: true });
+    if (normalized.ok) {
+      if (normalized.value !== stored.trim()) {
+        try {
+          localStorage.setItem(STORAGE_KEY, normalized.value);
+        } catch (error) {
+          console.warn("[watch-together] failed to migrate api base", error);
+        }
+      }
+      return normalized.value;
+    }
+
+    return stored.trim();
+  }
+
+  function ensureNormalizedApiBase(options) {
+    const normalized = normalizeApiBase(state.apiBase, options);
+    if (!normalized.ok) {
+      return normalized;
+    }
+
+    if (state.apiBase !== normalized.value) {
+      state.apiBase = normalized.value;
+      try {
+        localStorage.setItem(STORAGE_KEY, state.apiBase);
+      } catch (error) {
+        console.warn("[watch-together] failed to persist normalized api base", error);
+      }
+      persistSession();
+    }
+
+    return normalized;
+  }
+
+  function normalizeApiBase(value, options) {
+    const raw = typeof value === "string" ? value.trim() : "";
+    if (!raw) {
+      return options && options.useDefaultWhenEmpty
+        ? { ok: true, value: DEFAULT_REMOTE_API_BASE }
+        : { ok: false, error: "请输入服务地址" };
+    }
+
+    let candidate = raw.replace(/\/+$/, "");
+    if (/^http:\/\/7e526c6c1d80\.ofalias\.net:53120\/?$/i.test(candidate)) {
+      candidate = DEFAULT_REMOTE_API_BASE;
+    } else if (!/^[a-z][a-z\d+\-.]*:\/\//i.test(candidate)) {
+      candidate = `https://${candidate}`;
+    }
+
+    let parsed;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      return { ok: false, error: "请输入完整地址，例如 https://example.com" };
+    }
+
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return { ok: false, error: "服务地址只支持 http:// 或 https://" };
+    }
+
+    parsed.hash = "";
+    parsed.search = "";
+    if (parsed.pathname === "/") {
+      parsed.pathname = "";
+    }
+
+    return { ok: true, value: parsed.toString().replace(/\/+$/, "") };
   }
 
   function getMaxEventId(events, fallback) {

@@ -18,7 +18,7 @@ npm install
 npm run dev
 ```
 
-默认监听 `0.0.0.0:8787`。
+默认监听 `0.0.0.0:7777`。
 
 - 如果 `certs/server.key` 和 `certs/server.crt` 存在，则自动以 HTTPS 启动
 - 如果证书不存在，则退回 HTTP 启动
@@ -28,13 +28,13 @@ npm run dev
 HTTP：
 
 ```text
-[server] HTTP polling server listening on http://0.0.0.0:8787
+[server] HTTP polling server listening on http://0.0.0.0:7777
 ```
 
 HTTPS：
 
 ```text
-[server] HTTPS polling server listening on https://0.0.0.0:8787
+[server] HTTPS polling server listening on https://0.0.0.0:7777
 [server] Using certificate files: key=..., cert=...
 ```
 

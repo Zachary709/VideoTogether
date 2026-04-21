@@ -7,7 +7,7 @@ import { createClientId, parseMessage } from "./protocol";
 import { RoomManager } from "./roomManager";
 import type { BaseMessage, JoinResponse, PlaybackSnapshot, PollResponse, ReportStateResponse } from "./types";
 
-const PORT = Number(process.env.PORT ?? 8787);
+const PORT = Number(process.env.PORT ?? 7777);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const CLEANUP_INTERVAL_MS = 20_000;
 const CERT_DIR = join(process.cwd(), "certs");

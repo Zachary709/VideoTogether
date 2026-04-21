@@ -48,7 +48,7 @@ npm install
 npm run dev
 ```
 
-默认监听 `0.0.0.0:8787`。
+默认监听 `0.0.0.0:7777`。
 
 - 如果存在 `server/certs/server.key` 和 `server/certs/server.crt`，则自动以 HTTPS 启动
 - 否则以 HTTP 启动
@@ -66,8 +66,10 @@ npm run dev
 
 脚本面板中可直接填写服务地址：
 
-- 本地调试：`http://localhost:8787`
+- 本地调试：`http://localhost:7777`
 - 远程联调：填写你的 `https://域名:端口`
+
+如果填的是 `域名:端口` 这种不带协议的形式，脚本会自动补成 `https://域名:端口`。
 
 注意：用户脚本运行在 HTTPS 的 Bilibili 页面里时，远程地址必须是 `https://`，不能是 `http://`。
 
